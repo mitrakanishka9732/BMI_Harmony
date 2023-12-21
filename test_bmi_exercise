@@ -1,0 +1,888 @@
+/**
+ * @file bmi_exercise.cpp
+ * @brief receive a UDP input from EEG cap and perform an exercise!
+ * @version 0.2
+ */
+
+/******************************************************************************************
+ * INCLUDES
+ *****************************************************************************************/
+#include "research_interface.h"
+#include <array>
+#include <chrono>
+#include <fstream>
+#include <iostream>
+#include <string>
+#include <thread>
+#include <cmath>
+#include <future>
+
+//UDP include
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <unistd.h>
+#include <cstring>
+
+#define PI 3.141592653
+#define DEG_2_RAD PI / 180
+
+//UDP define
+#define PORT 8080
+#define MAX_BUFFER_SIZE 1024
+
+#define s400Stiffness_Nm_p_rad 15.0 // desired joint stiffness for series 400 [shoulder] motors(max is 50)
+#define s600Stiffness_Nm_p_rad 15.0 // desired joint stiffness for series 600 [elbow] motors (max is 30)
+#define s700Stiffness_Nm_p_rad  1.5 // desired joint stiffness for series 700 [wrist] motors(max is 3)
+
+#ifdef WRIST_MODS
+#define WD_SCALING 1.0
+#define WF_SCALING 0.33
+#endif
+
+#ifdef TORSO_MODS
+#define nCols 2 * harmony::armJointCount + harmony::torsoJointCount + 1 // number of columns in dataset
+#else
+#define nCols 2 * harmony::armJointCount + 1 // number of columns in dataset
+#endif
+
+/******************************************************************************************
+ * Structs
+ *****************************************************************************************/
+struct AllArmsOverrides {
+    harmony::ArmJointsOverride leftOverrides;
+    harmony::ArmJointsOverride rightOverrides;
+#ifdef TORSO_MODS
+    harmony::TorsoJointsOverride torsoOverrides;
+#endif
+};
+
+/**
+ * @brief Prints the start script before writing to harmony
+ *
+ * @param fs sample frequency from logfile
+ */
+void printStart(double fs) {
+    // std::cout << "stiffness : " << stiffness_Nm_p_rad << " Nm per rad\n";
+    std::cout << "fs : " << fs << " Hz\n";
+    std::cout << "Starting in";
+    std::cout.flush();
+
+    for (int i = 3; i >= 1; i--) {
+        std::cout << "..." << i;
+        std::cout.flush();
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+
+    std::cout << "\n--> LETS EXERCISE <--\n";
+}
+
+/**
+ * @brief Locks the user in place to start recording
+ *
+ * @return true if the user hits [return]
+ * @return false if the user hits [q]
+ */
+bool waitToStart() {
+    std::string usr_input;
+
+    // lambda function to check if valid response
+    auto valid_response = [&]() -> bool { return usr_input.length() == 0 || usr_input == "q" || usr_input == "g"; };
+
+    do {
+        std::cout << "Enter [return] to start exercise or [q] to quit. ";
+        std::getline(std::cin, usr_input);
+    } while (!valid_response());
+
+    bool startRecording = usr_input.length() == 0;
+    if (!startRecording) { std::cout << "Exiting..." << std::endl; }
+
+    return startRecording;
+}
+
+
+/**
+ * @brief stops the exercise when user input matches with []
+ *
+ * @return true if the user hits [return]
+ * @return false if the user hits [q]
+ */
+bool stopExercise() {
+    std::string usr_input;
+
+    // lambda function to check if valid response
+    auto valid_response = [&]() -> bool { return usr_input == "s"; };
+
+    do {
+        std::cout << "Enter [s] to stop the exercise. ";
+        std::getline(std::cin, usr_input);
+    } while (!valid_response());
+
+    bool stopRecording;
+    if (usr_input == "s")
+    {
+        stopRecording = true;
+    }
+    else
+    {
+        stopRecording = false;
+    }
+
+    if (!stopRecording) { std::cout << "Exiting..." << std::endl; }
+
+    return stopRecording;
+}
+
+
+/**
+ * @brief returns the desired joint position for home mode
+ */
+
+std::array<double, nCols> setHomePosition(harmony::ResearchInterface *info)
+{  
+    std::array<double, nCols> data;
+
+    // // std::array<double, nCols> homepositionRight_array = {0, 0, 0, 30, 45, -90, 40};
+    // // std::array<double, nCols> homepositionLeft_array = {0, 0, 0, -30, -45, 90, -40};
+
+    std::array<double, nCols> homepositionRight_array = {6.3, -2.2, -8, -6, -30, -114, 10};
+    std::array<double, nCols> homepositionLeft_array = {-6.3, 2.2, 8, 6, 30, 114, -10};
+
+    data[0] = 0.0;
+
+    for (int i = 0; i < harmony::armJointCount; i++) { data[i + 1] = DEG_2_RAD * homepositionLeft_array[i];}
+    for (int i = 0; i < harmony::armJointCount; i++) { data[i + harmony::armJointCount + 1] = DEG_2_RAD * homepositionRight_array[i]; }
+
+    return data;
+}
+
+/**
+ * @brief returns the desired joint position for execise mode
+ */
+
+std::array<double, nCols> setEndPoint2(harmony::ResearchInterface *info)
+{
+    std::array<double, nCols> data;
+    
+    // std::array<double, nCols> endpointRight_array = {0, 0, 3, 17, -80, -20, 45};
+    // std::array<double, nCols> endpointLeft_array = {0, 0, -3, -17, 80, 20, -45};
+
+    std::array<double, nCols> endpointRight_array = {20, -8.6, -6.3, -21, 69, -31, 0.6};
+    std::array<double, nCols> endpointLeft_array = {-20, 8.6, 6.3, 21, -69, 31, -0.6};
+
+    data[0] = 0.0;
+
+    for (int i = 0; i < harmony::armJointCount; i++) { data[i + 1] = DEG_2_RAD * endpointLeft_array[i];}
+    for (int i = 0; i < harmony::armJointCount; i++) { data[i + harmony::armJointCount + 1] = DEG_2_RAD * endpointRight_array[i];}
+
+    return data;
+}
+
+/**
+ * @brief returns the desired amplitude position for exercise mode
+ */
+
+std::array<double, nCols> setAmplitude(harmony::ResearchInterface *info)
+{
+    std::array<double, nCols> data;
+
+    //std::array<double, nCols> startpointRight_array = {0, 0, 0, 30, 45, -90, 40};
+    std::array<double, nCols> startpointLeft_array = {0, 0, 0, -30, -45, 90, -40, 0, 0, 0, 30, 45, -90, 40};
+
+    //std::array<double, nCols> endpointRight_array = {0, 0, 3, 17, 80, -20, -45};
+    std::array<double, nCols> endpointLeft_array = {0, 0, -3, -17, -80, 20, 45, 0, 0, 3, 17, 80, -20, -45};
+
+    data[0] = 0.0;
+
+
+    for (int i = 1; i < nCols; i++) { data[i] = DEG_2_RAD * endpointLeft_array[i] - DEG_2_RAD *startpointLeft_array[i];}
+    // for (int i = 0; i < harmony::armJointCount; i++) { data[i + 1] = DEG_2_RAD * endpointLeft_array[i] - DEG_2_RAD *startpointLeft_array[i];}
+    // for (int i = 0; i < harmony::armJointCount; i++) { data[i + harmony::armJointCount + 1] = DEG_2_RAD * endpointRight_array[i + harmony::armJointCount + 1] - DEG_2_RAD * startpointRight_array[i + harmony::armJointCount + 1]; }
+
+    // for (int i = 0; i < nCols; i++) {
+    //     std::cout << "Amplitude" << i << " : " << data[i] << std::endl;
+    // }
+
+    return data;
+}
+
+/**
+ * @brief returns the desired joint position for exercise mode starting from a sinusoid
+ */
+
+std::array<double, nCols> get_point_in_trajectory(harmony::ResearchInterface *info, int iter, int nSteps)
+{
+    std::array<double, nCols> data;
+
+    data[0] = 0.0;
+
+    std::array<double, nCols> homepositionRight_array = {0, 0, 0, 30, 45, -90, 40};
+    std::array<double, nCols> homepositionLeft_array = {0, 0, 0, -30, -45, 90, -40};
+    std::array<double, nCols> movement_amplitude = setAmplitude(info);
+
+    if (iter <= nSteps / 2)
+    {
+        for (int i = 0; i < harmony::armJointCount; i++) {
+            data[i + 1] =
+                DEG_2_RAD * homepositionLeft_array[i + 1] + movement_amplitude[i + 1] * sin(2 * PI * iter / nSteps);
+        }
+        for (int i = 0; i < harmony::armJointCount; i++) {
+            data[i + harmony::armJointCount + 1] =
+                DEG_2_RAD * homepositionRight_array[i + harmony::armJointCount + 1] +
+                movement_amplitude[i + harmony::armJointCount + 1] * sin(2 * PI * iter / nSteps);
+        }
+    } 
+    else 
+    {
+        for (int i = 0; i < harmony::armJointCount; i++) {
+            data[i + 1] = DEG_2_RAD * homepositionLeft_array[i + 1];
+        }
+        for (int i = 0; i < harmony::armJointCount; i++) {
+            data[i + harmony::armJointCount + 1] = DEG_2_RAD * homepositionRight_array[i + harmony::armJointCount + 1];
+        }
+    }
+
+    // for (int i = 0; i < harmony::armJointCount; i++) {
+    //     std::cout << "Amplitude Joint" << i << " : " << movement_amplitude[i + 1]
+    //               << " LEFT_DesiredSin joint: " << i << " : " << data[i + 1] 
+    //               << " RIGHT_DesiredSin Join: " << i << " : " << data[i + harmony::armJointCount + 1] << std::endl;
+    // }
+
+    // for (int i = 0; i < harmony::armJointCount; i++) {
+    //     std::cout << "LEFT Amplitude Joint" << i << " : " << movement_amplitude[i + 1]
+    //               << "RIGHT Ampliyude Joint" << i << " : " << movement_amplitude[i + harmony::armJointCount + 1] << std::endl;
+    // }
+
+    return data;
+}
+
+
+/**
+ * @brief returns the desired joint stiffness based on the actuator type
+ * Joints <5 are all series 400, joint 5 is the elbow series 500, and
+ * joint 6 is the wrist series 700 joint.
+ * @param joint_idx current index for joint
+ * @return double the desired joint stiffness
+ */
+double jointStiffness(int joint_idx) {
+    double stiffness;
+    harmony::ArmJoint joint = harmony::ArmJoint(joint_idx);
+
+    switch (joint) {
+        case harmony::ArmJoint::elbowFlexion:
+            stiffness = s600Stiffness_Nm_p_rad;
+            break;
+        case harmony::ArmJoint::wristPronation:
+            stiffness = s700Stiffness_Nm_p_rad;
+            break;
+        #ifdef WRIST_MODS
+        case harmony::ArmJoint::wristAbduction:
+            stiffness = WD_SCALING * s700Stiffness_Nm_p_rad;
+            break;
+        case harmony::ArmJoint::wristFlexion:
+            stiffness = WF_SCALING * s700Stiffness_Nm_p_rad;
+            break;
+        #endif
+        default:
+            stiffness = s400Stiffness_Nm_p_rad;
+            break;
+    }
+
+    return stiffness;
+}
+
+/**
+ * @brief returns the desired joint stiffness based on the actuator type
+ * Joints <5 are all series 400, joint 5 is the elbow series 500, and
+ * joint 6 is the wrist series 700 joint.
+ * @param joint_idx current index for joint
+ * @param scaling is used to indirectly control the stiffnesses
+ * @return double the desired joint stiffness
+ */
+double jointStiffness(int joint_idx, double scaling) {
+    double stiffness;
+    harmony::ArmJoint joint = harmony::ArmJoint(joint_idx);
+
+    switch (joint) {
+        case harmony::ArmJoint::elbowFlexion:
+            stiffness = s600Stiffness_Nm_p_rad * scaling;
+            break;
+        case harmony::ArmJoint::wristPronation:
+            stiffness = s700Stiffness_Nm_p_rad * scaling;
+            break;
+        #ifdef WRIST_MODS
+        case harmony::ArmJoint::wristAbduction:
+            stiffness = WD_SCALING * s700Stiffness_Nm_p_rad * scaling;
+            break;
+        case harmony::ArmJoint::wristFlexion:
+            stiffness = WF_SCALING * s700Stiffness_Nm_p_rad * scaling;
+            break;
+        #endif
+        default:
+            stiffness = s400Stiffness_Nm_p_rad;
+            break;
+    }
+
+    return stiffness;
+}
+
+/**
+ * @brief Takes a data array and converts it to override format
+ *
+ * @param data read data line from log file, parsed to array
+ * @return AllArmsOverrides studt containing left and right overrides
+ */
+AllArmsOverrides data2override(std::array<double, nCols> data) {
+    std::array<harmony::JointOverride, harmony::armJointCount> leftOverrides;
+    std::array<harmony::JointOverride, harmony::armJointCount> rightOverrides;
+    for (int i = 0; i < harmony::armJointCount; i++) {
+        leftOverrides[i] = {data[i + 1], jointStiffness(i)};
+        rightOverrides[i] = {data[i + harmony::armJointCount + 1], jointStiffness(i)};
+    }
+
+#ifdef TORSO_MODS
+    std::array<harmony::JointOverride, harmony::torsoJointCount> torsoOverrides;
+    for (int i = 0; i < harmony::torsoJointCount; i++) {
+        torsoOverrides[i] = {data[i + harmony::armJointCount * 2 + 1], jointStiffness(i)};
+    }
+#endif
+
+    return {harmony::ArmJointsOverride(leftOverrides),
+            harmony::ArmJointsOverride(rightOverrides)
+#ifdef TORSO_MODS
+            , harmony::TorsoJointsOverride(torsoOverrides)
+#endif
+            };
+}
+
+/**
+ * @brief Takes a data array and converts it to override format
+ *
+ * @param data read data line from log file, parsed to array
+ * @param scaling indirectly controlls impedence values
+ * @return AllArmsOverrides studt containing left and right overrides
+ */
+AllArmsOverrides data2override(std::array<double, nCols> data, double scaling) {
+    std::array<harmony::JointOverride, harmony::armJointCount> leftOverrides;
+    std::array<harmony::JointOverride, harmony::armJointCount> rightOverrides;
+    for (int i = 0; i < harmony::armJointCount; i++) {
+        leftOverrides[i] = {data[i + 1], jointStiffness(i, scaling)};
+        rightOverrides[i] = {data[i + harmony::armJointCount + 1], jointStiffness(i, scaling)};
+    }
+
+#ifdef TORSO_MODS
+    std::array<harmony::JointOverride, harmony::torsoJointCount> torsoOverrides;
+    for (int i = 0; i < harmony::torsoJointCount; i++) {
+        torsoOverrides[i] = {data[i + harmony::armJointCount * 2 + 1], jointStiffness(i, scaling)};
+    }
+#endif
+
+    return {harmony::ArmJointsOverride(leftOverrides),
+            harmony::ArmJointsOverride(rightOverrides)
+#ifdef TORSO_MODS
+            , harmony::TorsoJointsOverride(torsoOverrides)
+#endif
+            };
+}
+
+void printStates(std::array<harmony::JointState, harmony::armJointCount> states) {
+    for (int i = 0; i < harmony::armJointCount; i++) {
+        std::cout << "joint " << i << " position (rad): " << states[i].position_rad
+                  << " torque (Nm): " << states[i].torque_Nm << std::endl;
+    }
+    std::cout << std::endl;
+}
+
+/**
+ * @brief Read info for current arm positions and return the posisitons as Joint Overrides
+ * 
+ * @param info pointer to research interface
+ * @return AllArmsOverrides object holding left, right, and torso overrides
+ */
+std::array<double, nCols> getCurrentArmPositionsAsDataLine(harmony::ResearchInterface* info) {
+    auto leftStates = info->joints().leftArm.getOrderedStates();
+    auto rightStates = info->joints().rightArm.getOrderedStates();
+
+    std::array<double, nCols> data;
+
+    data[0] = 0.0;
+
+    for (int i = 0; i < harmony::armJointCount; i++) { data[i + 1] = leftStates[i].position_rad; }
+    for (int i = 0; i < harmony::armJointCount; i++) { data[i + harmony::armJointCount + 1] = rightStates[i].position_rad; }
+
+    #ifdef TORSO_MODS
+    auto torsoStates = info->joints().torso.getOrderedStates();
+    for (int i = 0; i < harmony::torsoJointCount; i++) { data[i + 2 * harmony::armJointCount + 1] = torsoStates[i].position_rad; }
+    #endif
+
+    return data;
+}
+
+/**
+ * @brief Given an initial and target position, interpolate between the two
+ * Moves each joint (linearly) towards the traget posiiton with the iter representing the
+ * current step taken out of nSteps. This function returns AllArmsOverrides to be pushed to
+ * Harmony
+ * @param initialOverride Initial position as AllArmsOverrides
+ * @param targetOverride Target Position as AllArmsOverrides
+ * @param iter iteration of interpolation
+ * @param nSteps number of steps to take between initial and target positions 
+ * @return AllArmsOverrides the override command per the _iter_ step
+ */
+std::array<double, nCols> step2targetPosition(  std::array<double, nCols> start,
+                                                std::array<double, nCols> finish,
+                                                int iter, int nSteps ) {
+
+    std::array<double, nCols> step;
+    step[0] = 0.;
+
+    for (int i = 1; i < nCols; i++) {
+        step[i] = start[i] + (finish[i] - start[i]) * iter / nSteps;
+    }
+    return step;
+    
+}
+
+/*******UDP LOOP*********/
+void UDPloop(char *buffer, int buffer_len, struct sockaddr_in cliaddr, int sockfd){
+
+    while(true){
+      // Receiving data from the client
+      buffer_len = sizeof(cliaddr);
+      int n = recvfrom(sockfd, (char *)buffer, MAX_BUFFER_SIZE, MSG_WAITALL, (struct sockaddr *)&cliaddr, (socklen_t*)&buffer_len);
+      buffer[n] = '\0';
+      std::cout << "Client: " << buffer << std::endl;
+
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+}
+
+int main(){
+
+    double fs = 200; // recording frequency
+    uint T_ms = uint(1000 / fs);; // recording time step
+
+//     /*--------- Init Research Interface --------*/
+    harmony::ResearchInterface info;
+    if(!info.init()) {
+        std::cerr << "Failed to initialize Research Interface" << std::endl;
+        return -1;
+    }
+    else
+    {
+        std::cout << "Research interface initialized!" << std::endl; 
+    }
+
+    #ifdef TORSO_MODS
+    auto torso = info.makeTorsoController();
+    if (!torso->init()) {
+        std::cerr << "Failed to initialize Torso Controller" << std::endl;
+        return -1;
+    }
+    else
+    {
+        std::cout << "Torso Controller initialized!" << std::endl; 
+    }
+    #endif
+
+    auto left = info.makeLeftArmController(); // left arm controller
+    auto right = info.makeRightArmController(); // right arm controller
+    if (!left->init() || !right->init()) {
+        std::cerr << "Failed to initialize Arm Controllers" << std::endl;
+        return -1;
+    }
+
+        /*--------- Scale Up Impedence Control --------*/
+    std::cout << "Scaling Up Impedence Control Values [4s]"<< std::endl;
+    std::cout.flush();
+
+    int bufferTime_s = 4;
+    int nSteps = bufferTime_s * fs;
+    // std::cout << "right joint states:" << std::endl;
+    // printStates(info.joints().rightArm.getOrderedStates());
+    
+    auto robotStartPosition = getCurrentArmPositionsAsDataLine(&info);
+
+    for (int i = 0; i < harmony::armJointCount; i++)
+    {
+        robotStartPosition = getCurrentArmPositionsAsDataLine(&info);
+        auto overrides = data2override(robotStartPosition, i / nSteps);
+
+        left->setJointsOverride(overrides.leftOverrides);
+        right->setJointsOverride(overrides.rightOverrides);
+#ifdef TORSO_MODS 
+        torso->setJointsOverride(overrides.torsoOverrides);
+#endif
+        if (i * T_ms % 1000 == 0) {
+            std::cout << ".";
+            std::cout.flush();
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(T_ms));
+
+        // std::cout << "Joint Values: " << robotStartPosition[i] << ' ' << std::endl;
+    }
+
+    // UDP socket initialization 
+
+    int sockfd, buffer_len;
+    char buffer[MAX_BUFFER_SIZE];
+    struct sockaddr_in servaddr, cliaddr;
+
+    // Creating socket file descriptor
+    sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sockfd < 0) {
+        std::cerr << "socket creation failed" << std::endl;
+        return 1;
+    }
+    else{
+      std::cout << "Socket succesflly created!" << std::endl;
+    }
+
+    memset(&servaddr, 0, sizeof(servaddr));
+    memset(&cliaddr, 0, sizeof(cliaddr));
+
+    // Filling server information
+    servaddr.sin_family = AF_INET; // IPv4
+    servaddr.sin_addr.s_addr = INADDR_ANY;
+    servaddr.sin_port = htons(PORT);
+
+    // Bind the socket with the server address
+    if (bind(sockfd, (const struct sockaddr *)&servaddr, sizeof(servaddr)) < 0) {
+        std::cerr << "bind failed" << std::endl;
+        return 1;
+    }
+    else{
+      std::cout << "Binded succesflly!" << std::endl;
+    }
+
+    std::cout << "DONE\n"; 
+
+    //Calling UDP Thread !!
+    std::thread udpBackground(UDPloop, buffer, buffer_len, cliaddr, sockfd);
+    char* UDPinput = buffer;
+    while(true){
+        //std::cout << "UDP Input:" << UDPinput << std::endl;
+        if (*UDPinput == 'g')
+        {
+            std::cout << "START!";
+        }
+        else if(*UDPinput == 's')
+        {
+            std::cout << "STOP!";
+            break; 
+        }
+        else
+        {
+            std::cout << "waiting!";
+        }
+    }
+    udpBackground.join();
+
+     /*--------- Move Harmony to start position --------*/
+    std::cout << "Moving Harmony to starting position [5s]";
+    std::cout.flush();
+    bufferTime_s = 5;
+    nSteps = bufferTime_s * fs;
+
+    std::array<double, nCols> data;
+    std::array<double, nCols> prevData = robotStartPosition;
+    std::array<double, nCols> exerciseStartPos = setHomePosition(&info);
+
+    for (int i=0; i<=nSteps; i++) {
+        data = step2targetPosition(robotStartPosition, exerciseStartPos , i, nSteps);
+        
+        auto overrides = data2override(data);
+
+        left->setJointsOverride(overrides.leftOverrides);
+        right->setJointsOverride(overrides.rightOverrides);
+#ifdef TORSO_MODS
+        torso->setJointsOverride(overrides.torsoOverrides);
+#endif
+
+        if (i * T_ms % 1000 == 0) {
+            std::cout << ".";
+            std::cout.flush();
+        }    
+        std::this_thread::sleep_for(std::chrono::milliseconds(T_ms));
+        prevData = data;
+    }
+
+    std::cout << "DONE\n";
+
+
+    std::cout << "Waiting to start exercise\n";
+
+    if (*UDPinput != 'g') { return -1; }
+    
+    /*--------- Begin exercise [60s] --------*/
+    printStart(fs);
+    // fs = 200;
+    bufferTime_s = 15;
+    nSteps = bufferTime_s * fs;
+
+    robotStartPosition = prevData; //getCurrentArmPositionsAsDataLine(&info);
+    exerciseStartPos = setEndPoint2(&info);
+
+    
+
+    
+    for (int i = 0; i<nSteps;i++)
+    {      
+        
+        data = step2targetPosition(robotStartPosition, exerciseStartPos, i, nSteps);
+
+        auto overrides = data2override(data);
+
+        left->setJointsOverride(overrides.leftOverrides);
+        right->setJointsOverride(overrides.rightOverrides);
+
+        if (i * T_ms % 1000 == 0) {
+            std::cout << ".";
+            std::cout.flush();
+        }
+
+        prevData = data;
+      
+        std::this_thread::sleep_for(std::chrono::milliseconds(T_ms));
+    
+    }
+
+
+    // do{
+        
+    //     for (int i = 0; i<nSteps;i++)
+    //     {   
+    //         std::cin >> usr_input; 
+    //         data = step2targetPosition(robotStartPosition, exerciseStartPos, i, nSteps);
+
+    //         auto overrides = data2override(data);
+
+    //         left->setJointsOverride(overrides.leftOverrides);
+    //         right->setJointsOverride(overrides.rightOverrides);
+
+    //         /*
+    //         if (i * T_ms % 1000 == 0) {
+    //             std::cout << ".";
+    //             std::cout.flush();
+    //         }
+    //         */
+
+    //         prevData = data;
+    //         std::this_thread::sleep_for(std::chrono::milliseconds(T_ms));
+    //         if(usr_input == "s"){break;}
+    //     }
+    //     //std::cin >> usr_input;     
+    // }while(usr_input!= "s");
+
+
+
+    
+    /*
+    while(true){
+        //std::cout << "UDP Input:" << UDPinput << std::endl;
+        if (*UDPinput == 'g')
+        {
+            std::cout << "START!";
+        }
+        else if(*UDPinput == 's')
+        {
+            std::cout << "STOP!";
+            break; 
+        }
+        else
+        {
+            std::cout << "waiting!";
+        }
+    }
+    */
+
+    
+
+//     /*--------- Move Harmony to start position --------*/
+//     std::cout << "Moving Harmony to starting position [5s]";
+//     std::cout.flush();
+//     bufferTime_s = 5;
+//     nSteps = bufferTime_s * fs;
+
+//     std::array<double, nCols> data;
+//     std::array<double, nCols> prevData = robotStartPosition;
+//     std::array<double, nCols> exerciseStartPos = setHomePosition(&info);
+
+//     for (int i=0; i<=nSteps; i++) {
+//         data = step2targetPosition(robotStartPosition, exerciseStartPos , i, nSteps);
+        
+//         auto overrides = data2override(data);
+
+//         left->setJointsOverride(overrides.leftOverrides);
+//         right->setJointsOverride(overrides.rightOverrides);
+// #ifdef TORSO_MODS
+//         torso->setJointsOverride(overrides.torsoOverrides);
+// #endif
+
+//         if (i * T_ms % 1000 == 0) {
+//             std::cout << ".";
+//             std::cout.flush();
+//         }    
+//         std::this_thread::sleep_for(std::chrono::milliseconds(T_ms));
+//         prevData = data;
+//     }
+
+//     std::cout << "DONE\n";
+
+
+//     std::cout << "Waiting to start exercise\n";
+
+//     if (!waitToStart()) { return -1; }
+
+//     /*--------- Begin exercise [60s] --------*/
+//     printStart(fs);
+//     // fs = 200;
+//     bufferTime_s = 15;
+//     nSteps = bufferTime_s * fs;
+
+//     robotStartPosition = prevData; //getCurrentArmPositionsAsDataLine(&info);
+//     exerciseStartPos = setEndPoint2(&info);
+
+//     // std::string usr_input;
+//     // std::cout << "Enter [s] to stop the exercise. ";
+//     // std::cout.flush();
+
+//     // usr_input = "a";
+    
+//     // std::getline(std::cin, usr_input);
+    
+//     // // auto valid_response = [&]() -> bool { return usr_input.length() == 0 || usr_input == "q"; };
+
+//     // if (usr_input.length() == 0)
+//     // {
+//     //     std::cout << "no input "; // << usr_input << std::endl;
+
+//     // }
+
+    
+//     // for (int i = 0; i<nSteps || usr_input != "s";i++)
+//     // {      
+        
+        
+
+//     //     data = step2targetPosition(robotStartPosition, exerciseStartPos, i, nSteps);
+
+//     //     auto overrides = data2override(data);
+
+//     //     left->setJointsOverride(overrides.leftOverrides);
+//     //     right->setJointsOverride(overrides.rightOverrides);
+
+//     //     if (i * T_ms % 1000 == 0) {
+//     //         std::cout << ".";
+//     //         std::cout.flush();
+//     //     }
+
+//     //     prevData = data;
+//     //     i++;
+//     //     std::this_thread::sleep_for(std::chrono::milliseconds(T_ms));
+//     //     std::cin >> usr_input; 
+//     // }
+
+
+//     // do{
+        
+//     //     for (int i = 0; i<nSteps;i++)
+//     //     {   
+//     //         std::cin >> usr_input; 
+//     //         data = step2targetPosition(robotStartPosition, exerciseStartPos, i, nSteps);
+
+//     //         auto overrides = data2override(data);
+
+//     //         left->setJointsOverride(overrides.leftOverrides);
+//     //         right->setJointsOverride(overrides.rightOverrides);
+
+//     //         /*
+//     //         if (i * T_ms % 1000 == 0) {
+//     //             std::cout << ".";
+//     //             std::cout.flush();
+//     //         }
+//     //         */
+
+//     //         prevData = data;
+//     //         std::this_thread::sleep_for(std::chrono::milliseconds(T_ms));
+//     //         if(usr_input == "s"){break;}
+//     //     }
+//     //     //std::cin >> usr_input;     
+//     // }while(usr_input!= "s");
+
+
+//     /*--------- Wait 5s before new command --------*/
+
+    std::cout << "Waiting time [5s]";
+    std::cout.flush();
+
+    bufferTime_s = 5;
+    nSteps = bufferTime_s * fs;
+
+    for (int i=0; i<=nSteps;i++)
+    {
+        
+        if (i * T_ms % 1000 == 0) {
+            std::cout << ".";
+            std::cout.flush();
+        } 
+
+        // prevData = data;
+        std::this_thread::sleep_for(std::chrono::milliseconds(T_ms));
+    }
+
+
+    // // for (int i=0; i<=nSteps;i++)
+    // // {
+    // //     //std::array<double, nCols> data = get_point_in_trajectory(&info, i, nSteps);     
+
+        
+    // // }
+
+    std::cout << "WAIT DONE\n";
+
+    /*--------- Move Harmony back to start position --------*/
+    std::cout << "Moving Harmony back to starting position [10s]";
+    std::cout.flush();
+    bufferTime_s = 5;
+    nSteps = bufferTime_s * fs;
+
+    // std::array<double, nCols> data;
+    robotStartPosition = prevData; //getCurrentArmPositionsAsDataLine(&info);
+    exerciseStartPos = setHomePosition(&info);
+
+    for (int i=0; i<=nSteps; i++) {
+        data = step2targetPosition(robotStartPosition, exerciseStartPos , i, nSteps);
+        
+        auto overrides = data2override(data);
+
+        left->setJointsOverride(overrides.leftOverrides);
+        right->setJointsOverride(overrides.rightOverrides);
+#ifdef TORSO_MODS
+        torso->setJointsOverride(overrides.torsoOverrides);
+#endif
+
+        if (i * T_ms % 1000 == 0) {
+            std::cout << ".";
+            std::cout.flush();
+        }    
+        std::this_thread::sleep_for(std::chrono::milliseconds(T_ms));
+        prevData = data;
+    }
+
+    // std::cout << "DONE\n";
+
+    std::cout << "WE DID IT!" << std::endl;
+
+    /*--------- Close out --------*/
+    
+
+    left->removeOverride();
+    right->removeOverride();
+#ifdef TORSO_MODS
+    torso->removeOverride();
+#endif
+    close(sockfd);
+
+    return 0;
+
+}
